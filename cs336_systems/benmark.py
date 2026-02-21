@@ -74,7 +74,11 @@ def run_benchmark_once(
     steps: int,
     mode: str,
     use_mix: bool,
+    bf16_params: bool = False,
 ):
+    device = device
+
+    # Initialize model
     model = TransformerLM(
         vocab_size=10000,
         context_length=context_length,
@@ -85,15 +89,33 @@ def run_benchmark_once(
         rope_theta=10000,
     ).to(device)
 
-    optimizer = AdamW(model.parameters())
+    optimizer = None
+    if mode != "forward":
+        optimizer = AdamW(model.parameters())
+
+    # ✅ forward 模式可选：把“参数本身”转成 bf16（省一半参数显存）
+    # 注意：只建议在 CUDA 上用；CPU bf16 有时算子不全/更慢
+    if mode == "forward" and bf16_params and device == "cuda":
+        model = model.to(dtype=torch.bfloat16)
+
     inputs, targets = get_data(batch_size, context_length, device=device)
 
-    # warmup
-    model.train()
+    # warmup：forward 用 inference_mode，backward 才做 backward
     for _ in range(warmup_steps):
-        logits = model(inputs)
-        loss = cross_entropy_loss(logits, targets)
-        loss.backward()
+        if mode == "forward":
+            model.eval()
+            with torch.inference_mode():
+                with (torch.autocast(device_type=device, dtype=torch.bfloat16)
+                      if use_mix else nullcontext()):
+                    _ = model(inputs)
+        else:
+            model.train()
+            logits = model(inputs)
+            loss = cross_entropy_loss(logits, targets)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
         if device == "cuda":
             torch.cuda.synchronize()
 
@@ -102,16 +124,12 @@ def run_benchmark_once(
     if mode == "forward":
         model.eval()
         with nvtx.range("forward"):
-            for _ in range(steps):
+            for i in range(steps):
                 start_time = timeit.default_timer()
                 nvtx.range_push("forward step")
 
-                autocast_ctx = (
-                    torch.autocast(device_type=device, dtype=torch.bfloat16)
-                    if use_mix and device in ("cuda", "cpu")
-                    else nullcontext()
-                )
-                with autocast_ctx:
+                with (torch.autocast(device_type=device, dtype=torch.bfloat16)
+                      if use_mix else nullcontext()):
                     with torch.inference_mode():
                         model(inputs)
 
@@ -120,20 +138,13 @@ def run_benchmark_once(
                 nvtx.range_pop()
                 end_time = timeit.default_timer()
                 timings.append(end_time - start_time)
-
     else:
         model.train()
         with nvtx.range("forward+backward"):
-            for _ in range(steps):
+            for i in range(steps):
                 start_time = timeit.default_timer()
-
-                autocast_ctx = (
-                    torch.autocast(device_type=device, dtype=torch.bfloat16)
-                    if use_mix and device in ("cuda", "cpu")
-                    else nullcontext()
-                )
-
-                with autocast_ctx:
+                with (torch.autocast(device_type=device, dtype=torch.bfloat16)
+                      if use_mix else nullcontext()):
                     with nvtx.range("forward step"):
                         logits = model(inputs)
                     with nvtx.range("loss step"):
@@ -149,6 +160,8 @@ def run_benchmark_once(
                     torch.cuda.synchronize()
                 end_time = timeit.default_timer()
                 timings.append(end_time - start_time)
+
+
 
     mean_t = float(np.mean(timings))
     std_t = float(np.std(timings))
@@ -179,8 +192,9 @@ def main():
 
     parser.add_argument("--device", choices=["cuda", "cpu"],
                         default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--use_mix", action="store_true",
-                        help="Enable autocast(bfloat16)")
+    parser.add_argument("--use_mix", action="store_true", help="Enable autocast(bfloat16)")
+    parser.add_argument("--bf16_params", action="store_true",
+                    help="(forward only) Cast model parameters to bfloat16 to save memory")
 
     args = parser.parse_args()
 
@@ -218,6 +232,7 @@ def main():
             steps=args.steps,
             mode=args.mode,
             use_mix=args.use_mix,
+            bf16_params=args.bf16_params,
         )
         print(f"{name:<8} {cfg['d_model']:>7} {cfg['d_ff']:>7} {cfg['num_layers']:>7} {cfg['num_heads']:>7} | {mean_t:>10.6f} {std_t:>10.6f} {total_t:>10.4f}")
 
