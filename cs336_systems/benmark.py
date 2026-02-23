@@ -77,6 +77,8 @@ def benchmark(args):
         logits = model(inputs)
         loss = cross_entropy(logits, targets)
         loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
         if device == "cuda":
             torch.cuda.synchronize()
 
