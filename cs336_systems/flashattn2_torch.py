@@ -51,56 +51,51 @@ def flash_backward(Q, K, V, O, L, dO, is_causal = False):
 
 compiled_backward = torch.compile(flash_backward)
 
-class flashatten2(torch.autograd.Function):
+class FlashAttnWithTorch(torch.autograd.Function):
     @staticmethod
-    def forward(ctx,Q,K,V,is_causal=False):
-        # Q:[B,H,Q,D] / [B,Q,D]
-        # K:[B,H,K,D] / [B,K,D]
-        # V:[B,H,K,D] / [B,K,D]
-        # output:[B,H,Q,D] / [B,Q,D]
+    def forward(ctx, Q, K, V, is_causal=False):
         # 分块大小
-        Nq,D=Q.shape[-2],Q.shape[-1]
-        Nk=K.shape[-2]
-        Bq=32
-        Bk=32
-        Tq=(Nq+Bq-1)//Bq
-        Tk=(Nk+Bk-1)//Bk
-        softmax_scale=1/math.sqrt(D)
+        Bq = 32
+        Bk = 32
+        Nq, d = Q.shape[-2],Q.shape[-1]
+        Nk = K.shape[-2]
+        Tq = (Nq + Bq - 1) // Bq
+        Tk = (Nk + Bk - 1) // Bk
+        scale = 1.0 / math.sqrt(d)
         O = torch.empty_like(Q)
         L = torch.empty(Q.shape[:-1], device=Q.device)
         all_q_pos = torch.arange(Nq, device=Q.device)
         all_k_pos = torch.arange(Nk, device=Q.device)
         for i in range(Tq):
-            start_q=i*Bq
-            end_q=min((i+1)*Bq,Nq)
-            Qi=Q[...,start_q:end_q,:]
-            Oi=torch.zeros_like(Qi)
-            mi=torch.full(Qi.shape[:-1],float("-inf"),device=Q.device)
-            Li=torch.zeros_like(mi)
+            start_q = i * Bq
+            end_q = min((i + 1) * Bq, Nq)
+            Qi= Q[..., start_q:end_q, :]
+            Oi = torch.zeros_like(Qi)
+            mi = torch.full(Qi.shape[:-1], float('-inf'), device=Q.device)
+            Li = torch.zeros_like(mi)
             q_pos = all_q_pos[start_q:end_q]
             for j in range(Tk):
-                start_k=j*Bk
-                end_k=min((j+1)*Bk,Nk)
-                Kj=K[...,start_k:end_k,:]
-                Vj=V[...,start_k:end_k,:]
+                start_k = j * Bk
+                end_k = min((j + 1) * Bk, Nk)
+                Kj = K[..., start_k:end_k, :]
+                Vj = V[..., start_k:end_k, :]
+                Sij = einsum(Qi, Kj, "... q d, ... k d -> ... q k") * scale
                 k_pos = all_k_pos[start_k:end_k]
-                attn_scores = einsum(Qi, Kj, "... query d_k, ... key d_k -> ... query key") * softmax_scale
                 if is_causal:
                     mask = q_pos[:, None] >= k_pos[None, :]
-                    attn_scores = attn_scores.where(mask, torch.tensor(-1.0e6, dtype=attn_scores.dtype, device=attn_scores.device))
-                mij=torch.maximum(mi, torch.max(attn_scores, dim=-1)[0])
-                Pij = torch.exp(attn_scores - mij.unsqueeze(-1))
+                    Sij = Sij.where(mask, torch.tensor(-1.0e6, dtype=Sij.dtype, device=Sij.device))
+                mij = torch.maximum(mi, torch.max(Sij, dim=-1)[0])
+                Pij = torch.exp(Sij - mij.unsqueeze(-1))
                 s = torch.exp(mi - mij)
-                mi=mij
-                Li=Li*s+Pij.sum(dim=-1)
+                mi = mij
+                Li = s * Li + Pij.sum(dim=-1)
                 Pij = Pij.to(Vj.dtype)
-                Oi=Oi*s[..., None]+einsum(Pij, Vj, "... query key, ... key d_v -> ... query d_v")
+                Oi = Oi * s.unsqueeze(-1) + einsum(Pij, Vj, "... q k, ... k d -> ... q d")
             O[..., start_q:end_q, :] = (Oi / (Li.unsqueeze(-1) + 1e-6)).to(Q.dtype)
             L[..., start_q:end_q] = (mi + torch.log(Li)).to(L.dtype)
         ctx.save_for_backward(Q, K, V, O, L)
         ctx.is_causal = is_causal
         return O
-    
 
     @staticmethod
     def backward(ctx, dO):

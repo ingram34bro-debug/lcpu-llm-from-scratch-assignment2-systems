@@ -23,8 +23,8 @@ def make_attn_inputs(batch_size, Nq, Nk, D, dtype=torch.bfloat16, device="cuda")
     do = torch.randn(batch_size, Nq, D, dtype=dtype, device=device)
 
     return q, k, v, do
-torch_flash_compiled = torch.compile(FlashAttnWithTorch.apply, dynamic=True)
-
+torch_flash_compiled = torch.compile(FlashAttnWithTorch.apply,dynamic=True)
+#torch_flash_compiled = FlashAttnWithTorch.apply
 def test_timing_flash_forward_backward(Nq, Nk, D, dtype=torch.bfloat16, is_triton=False, device="cuda"):
     q, k, v, do = make_attn_inputs(1, Nq, Nk, D, dtype=dtype, device=device)
     if is_triton:
@@ -32,17 +32,23 @@ def test_timing_flash_forward_backward(Nq, Nk, D, dtype=torch.bfloat16, is_trito
     else:
         flash = torch_flash_compiled
     def run_fwd():
-        flash(q, k, v, True)
+        with torch.no_grad():
+            flash(q, k, v, True)
     def run_fwd_bwd():
         o = flash(q, k, v, True)
         o.backward(do)
-    run_fwd()
+    # warmup
+    for _ in range(5):
+        run_fwd()
+    for _ in range(5):
+        run_fwd_bwd()
+    q.grad = k.grad = v.grad = None
     f_time = triton.testing.do_bench(lambda: run_fwd(), rep=10, warmup=5)
     fb_time = triton.testing.do_bench(lambda: run_fwd_bwd(), grad_to_none=[q, k, v], rep=10, warmup=5)
     return f_time, fb_time
 
 def benchmark():
-    d_models = [16, 32, 64, 128]
+    d_models = [ 16,32, 64, 128]
     seq_lens = [128, 256, 512, 1024, 2048]
     dtypes = [torch.bfloat16, torch.float32]
     rows = []

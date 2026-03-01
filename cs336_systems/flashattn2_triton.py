@@ -2,7 +2,7 @@ import torch
 import triton
 import triton.language as tl
 from einops import rearrange
-
+import math
 
 @triton.jit
 def flash_fwd_kernel(
@@ -381,7 +381,7 @@ class FlashAttnWithTriton(torch.autograd.Function):
         V = rearrange(V, "... k d -> (...) k d")
         batch_size, N_QUERIES, d = Q.shape
         N_KEYS = K.shape[-2]
-        scale = 1.0 / (d ** 0.5)
+        scale = 1.0 / (math.sqrt(d))
         Tq = (N_QUERIES + Bq - 1) // Bq
         O = torch.empty_like(Q)
         L = torch.empty(Q.shape[:-1], device=Q.device)
@@ -413,7 +413,7 @@ class FlashAttnWithTriton(torch.autograd.Function):
         is_causal = ctx.is_causal
         batch_size, N_QUERIES, d = Q.shape
         N_KEYS = K.shape[-2]
-        scale = 1.0 / (d ** 0.5)
+        scale = 1.0 / (math.sqrt(d))
         Tq = (N_QUERIES + Bq - 1) // Bq
         Tk = (N_KEYS + Bk - 1) // Bk
         D = torch.zeros_like(L)
